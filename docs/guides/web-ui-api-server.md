@@ -59,6 +59,52 @@ mlx_audio.server --host 127.0.0.1 --port 8000 \
   --tts-max-batch-size 8
 ```
 
+### ReFeliciaV2 WebSocket TTS
+
+ReFeliciaV2's SBV2 TTS runtime can connect directly to MLX Audio at:
+
+```
+ws://127.0.0.1:8880/ws/tts
+```
+
+Run the API server on ReFelicia's default port:
+
+```bash
+MLX_AUDIO_REFELICIA_TTS_MODEL=mlx-community/Kokoro-82M-bf16 \
+mlx_audio.server --host 127.0.0.1 --port 8880
+```
+
+The Unity project defaults to `model=amitaro`; when `MLX_AUDIO_REFELICIA_TTS_MODEL`
+is set, MLX Audio maps that default name to the configured model ID. The endpoint
+sends a `start` JSON message, mono PCM16LE binary audio chunks, and an `end` JSON
+message, matching ReFelicia's `Sbv2WebSocketTtsRuntime`.
+
+For Irodori-TTS VoiceDesign:
+
+```bash
+MLX_AUDIO_REFELICIA_TTS_MODEL=mlx-community/Irodori-TTS-600M-v3-VoiceDesign-fp16 \
+MLX_AUDIO_REFELICIA_TTS_INSTRUCT="落ち着いた女性の声で、近い距離感でやわらかく自然に読み上げてください。" \
+MLX_AUDIO_REFELICIA_TTS_NUM_STEPS=6 \
+MLX_AUDIO_REFELICIA_TTS_SEQUENCE_LENGTH=300 \
+MLX_AUDIO_REFELICIA_TTS_CFG_GUIDANCE_MODE=alternating \
+mlx_audio.server --host 127.0.0.1 --port 8880
+```
+
+For voice cloning, set `MLX_AUDIO_REFELICIA_TTS_REF_AUDIO=/path/to/speaker.wav`.
+With Irodori, ReFelicia's `sbv2Voice` value is also treated as a reference audio
+path if it exists, otherwise as a VoiceDesign description.
+
+For Kokoro Japanese, use a Japanese voice such as `jf_alpha` or `jm_kumo`.
+MLX Audio infers `lang_code=j` from those voice names; you can also set it
+explicitly:
+
+```bash
+MLX_AUDIO_REFELICIA_TTS_MODEL=mlx-community/Kokoro-82M-bf16 \
+MLX_AUDIO_REFELICIA_TTS_LANG_CODE=j \
+MLX_AUDIO_REFELICIA_TTS_VOICE=jf_alpha \
+mlx_audio.server --host 127.0.0.1 --port 8880
+```
+
 ## OpenAI-Compatible API
 
 The server implements OpenAI-compatible endpoints, so existing code that targets the OpenAI audio API can point to MLX Audio with minimal changes.

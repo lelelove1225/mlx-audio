@@ -21,6 +21,7 @@ requires-python = ">=3.10"
 dependencies = [
     "huggingface_hub>=1.0",
     "miniaudio>=1.61",
+    "misaki>=0.9.4",
     "mlx-lm>=0.31.1",
     "mlx>=0.31.1",
     "numpy>=1.26.4",
@@ -38,8 +39,11 @@ stt = [
 
 # TTS dependencies
 tts = [
+    "misaki[en,ja]>=0.9.4",
     "mistral-common[audio]",
+    "num2words>=0.5.14",
     "sentencepiece>=0.2.0",
+    "spacy>=3.8.14",
 ]
 
 # Server dependencies

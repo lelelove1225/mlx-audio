@@ -47,3 +47,9 @@ output/
 claude.md
 .claude/site/
 .generated/legacy-docs-generated/
+
+# Local audio samples, voice-clone references, and demo outputs (not for sharing)
+/demo.wav
+/sample.mp3
+/sample_ref_*.mp3
+/*-test.wav

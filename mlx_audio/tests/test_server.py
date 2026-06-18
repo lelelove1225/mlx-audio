@@ -796,3 +796,245 @@ def test_stt_word_timestamps_verbose_json_words_passthrough(
     assert len(words) == 2
     assert words[0]["word"] == "Hello"
     assert words[1]["word"] == "world."
+
+
+def test_refelicia_tts_websocket_streams_pcm16(client, mock_model_provider):
+    mock_tts_model = MagicMock()
+    mock_tts_model.generate = MagicMock(wraps=sync_mock_audio_stream_generator)
+    mock_model_provider.load_model = MagicMock(return_value=mock_tts_model)
+
+    with client.websocket_connect("/ws/tts") as ws:
+        ws.send_json(
+            {
+                "text": "こんにちは",
+                "model": "test_tts_model",
+                "voice": "af_heart",
+                "speed": 1.1,
+                "pitch_scale": 0.9,
+                "delivery_mode": "full_audio",
+            }
+        )
+
+        start = ws.receive_json()
+        assert start == {
+            "type": "start",
+            "mode": "tts",
+            "delivery_mode": "full_audio",
+            "sample_rate": 16000,
+            "channels": 1,
+            "format": "pcm_s16le",
+        }
+
+        pcm = ws.receive_bytes()
+        assert len(pcm) > 0
+        assert len(pcm) % 2 == 0
+
+        end = ws.receive_json()
+        assert end["type"] == "end"
+        assert end["chunks"] == 1
+        assert end["segments"] == 1
+        assert end["audio_seconds"] > 0
+
+    mock_model_provider.load_model.assert_called_with("test_tts_model")
+    args, kwargs = mock_tts_model.generate.call_args
+    assert args[0] == "こんにちは"
+    assert kwargs["voice"] == "af_heart"
+    assert kwargs["speed"] == 1.1
+    assert kwargs["pitch"] == 0.9
+
+
+def test_refelicia_tts_websocket_maps_default_unity_model_with_env(
+    client, mock_model_provider, monkeypatch
+):
+    monkeypatch.setenv("MLX_AUDIO_REFELICIA_TTS_MODEL", "mlx-model-id")
+    mock_tts_model = MagicMock()
+    mock_tts_model.generate = MagicMock(wraps=sync_mock_audio_stream_generator)
+    mock_model_provider.load_model = MagicMock(return_value=mock_tts_model)
+
+    with client.websocket_connect("/ws/tts") as ws:
+        ws.send_json({"text": "hello", "model": "amitaro"})
+        assert ws.receive_json()["type"] == "start"
+        assert len(ws.receive_bytes()) > 0
+        assert ws.receive_json()["type"] == "end"
+
+    mock_model_provider.load_model.assert_called_with("mlx-model-id")
+
+
+def test_refelicia_tts_websocket_passes_irodori_env_kwargs(
+    client, mock_model_provider, monkeypatch
+):
+    monkeypatch.setenv(
+        "MLX_AUDIO_REFELICIA_TTS_MODEL",
+        "mlx-community/Irodori-TTS-600M-v3-VoiceDesign-fp16",
+    )
+    monkeypatch.setenv(
+        "MLX_AUDIO_REFELICIA_TTS_INSTRUCT",
+        "落ち着いた女性の声で自然に読み上げてください。",
+    )
+    monkeypatch.setenv("MLX_AUDIO_REFELICIA_TTS_NUM_STEPS", "6")
+    monkeypatch.setenv("MLX_AUDIO_REFELICIA_TTS_SEQUENCE_LENGTH", "300")
+    monkeypatch.setenv("MLX_AUDIO_REFELICIA_TTS_CFG_GUIDANCE_MODE", "alternating")
+
+    mock_tts_model = MagicMock()
+    mock_tts_model.model_type = "irodori_tts"
+    mock_tts_model.generate = MagicMock(wraps=sync_mock_audio_stream_generator)
+    mock_model_provider.load_model = MagicMock(return_value=mock_tts_model)
+
+    with client.websocket_connect("/ws/tts") as ws:
+        ws.send_json({"text": "今日はいい天気ですね。", "model": "amitaro"})
+        assert ws.receive_json()["type"] == "start"
+        assert len(ws.receive_bytes()) > 0
+        assert ws.receive_json()["type"] == "end"
+
+    args, kwargs = mock_tts_model.generate.call_args
+    assert args[0] == "今日はいい天気ですね。"
+    assert kwargs["instruct"] == "落ち着いた女性の声で自然に読み上げてください。"
+    assert kwargs["num_steps"] == 6
+    assert kwargs["sequence_length"] == 300
+    assert kwargs["cfg_guidance_mode"] == "alternating"
+
+
+def test_refelicia_tts_websocket_uses_irodori_voice_as_caption(
+    client, mock_model_provider
+):
+    mock_tts_model = MagicMock()
+    mock_tts_model.model_type = "irodori_tts"
+    mock_tts_model.generate = MagicMock(wraps=sync_mock_audio_stream_generator)
+    mock_model_provider.load_model = MagicMock(return_value=mock_tts_model)
+
+    with client.websocket_connect("/ws/tts") as ws:
+        ws.send_json(
+            {
+                "text": "こんにちは。",
+                "model": "mlx-community/Irodori-TTS-600M-v3-VoiceDesign-fp16",
+                "voice": "明るく元気な女性の声",
+            }
+        )
+        assert ws.receive_json()["type"] == "start"
+        assert len(ws.receive_bytes()) > 0
+        assert ws.receive_json()["type"] == "end"
+
+    _args, kwargs = mock_tts_model.generate.call_args
+    assert kwargs["instruct"] == "明るく元気な女性の声"
+
+
+def test_refelicia_tts_websocket_accepts_multiple_requests_on_same_connection(
+    client, mock_model_provider
+):
+    mock_tts_model = MagicMock()
+    mock_tts_model.generate = MagicMock(wraps=sync_mock_audio_stream_generator)
+    mock_model_provider.load_model = MagicMock(return_value=mock_tts_model)
+
+    with client.websocket_connect("/ws/tts") as ws:
+        ws.send_json({"text": "first", "model": "test_tts_model"})
+        assert ws.receive_json()["type"] == "start"
+        assert len(ws.receive_bytes()) > 0
+        assert ws.receive_json()["type"] == "end"
+
+        ws.send_json({"text": "second", "model": "test_tts_model"})
+        assert ws.receive_json()["type"] == "start"
+        assert len(ws.receive_bytes()) > 0
+        assert ws.receive_json()["type"] == "end"
+
+    assert mock_tts_model.generate.call_count == 2
+    assert mock_tts_model.generate.call_args_list[0].args[0] == "first"
+    assert mock_tts_model.generate.call_args_list[1].args[0] == "second"
+
+
+def test_refelicia_tts_websocket_passes_lang_code_from_env(
+    client, mock_model_provider, monkeypatch
+):
+    monkeypatch.setenv("MLX_AUDIO_REFELICIA_TTS_LANG_CODE", "j")
+    mock_tts_model = MagicMock()
+    mock_tts_model.generate = MagicMock(wraps=sync_mock_audio_stream_generator)
+    mock_model_provider.load_model = MagicMock(return_value=mock_tts_model)
+
+    with client.websocket_connect("/ws/tts") as ws:
+        ws.send_json(
+            {
+                "text": "こんにちは。",
+                "model": "mlx-community/Kokoro-82M-bf16",
+                "voice": "jf_alpha",
+            }
+        )
+        assert ws.receive_json()["type"] == "start"
+        assert len(ws.receive_bytes()) > 0
+        assert ws.receive_json()["type"] == "end"
+
+    _args, kwargs = mock_tts_model.generate.call_args
+    assert kwargs["voice"] == "jf_alpha"
+    assert kwargs["lang_code"] == "j"
+
+
+def test_refelicia_tts_websocket_infers_kokoro_lang_code_from_voice(
+    client, mock_model_provider
+):
+    mock_tts_model = MagicMock()
+    mock_tts_model.model_type = "kokoro"
+    mock_tts_model.generate = MagicMock(wraps=sync_mock_audio_stream_generator)
+    mock_model_provider.load_model = MagicMock(return_value=mock_tts_model)
+
+    with client.websocket_connect("/ws/tts") as ws:
+        ws.send_json(
+            {
+                "text": "こんにちは。",
+                "model": "mlx-community/Kokoro-82M-bf16",
+                "voice": "jm_kumo",
+            }
+        )
+        assert ws.receive_json()["type"] == "start"
+        assert len(ws.receive_bytes()) > 0
+        assert ws.receive_json()["type"] == "end"
+
+    _args, kwargs = mock_tts_model.generate.call_args
+    assert kwargs["voice"] == "jm_kumo"
+    assert kwargs["lang_code"] == "j"
+
+
+def test_refelicia_tts_websocket_forces_kokoro_japanese_text_to_japanese_voice(
+    client, mock_model_provider
+):
+    mock_tts_model = MagicMock()
+    mock_tts_model.model_type = "kokoro"
+    mock_tts_model.generate = MagicMock(wraps=sync_mock_audio_stream_generator)
+    mock_model_provider.load_model = MagicMock(return_value=mock_tts_model)
+
+    with client.websocket_connect("/ws/tts") as ws:
+        ws.send_json(
+            {
+                "text": "こんにちは。",
+                "model": "mlx-community/Kokoro-82M-bf16",
+                "voice": "af_heart",
+            }
+        )
+        assert ws.receive_json()["type"] == "start"
+        assert len(ws.receive_bytes()) > 0
+        assert ws.receive_json()["type"] == "end"
+
+    _args, kwargs = mock_tts_model.generate.call_args
+    assert kwargs["voice"] == "jf_alpha"
+    assert kwargs["lang_code"] == "j"
+
+
+def test_tts_speech_forces_kokoro_japanese_text_to_japanese_lang(
+    client, mock_model_provider
+):
+    mock_tts_model = MagicMock()
+    mock_tts_model.model_type = "kokoro"
+    mock_tts_model.generate = MagicMock(wraps=sync_mock_audio_stream_generator)
+    mock_model_provider.load_model = MagicMock(return_value=mock_tts_model)
+
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "mlx-community/Kokoro-82M-bf16",
+            "input": "こんにちは。",
+            "voice": "af_heart",
+            "response_format": "wav",
+        },
+    )
+
+    assert response.status_code == 200
+    _args, kwargs = mock_tts_model.generate.call_args
+    assert kwargs["voice"] == "jf_alpha"
+    assert kwargs["lang_code"] == "j"

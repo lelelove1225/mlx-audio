@@ -12,6 +12,7 @@ import inspect
 import io
 import json
 import os
+import re
 import subprocess
 import time
 import uuid
@@ -205,6 +206,33 @@ class SeparationResponse(BaseModel):
     target: str  # Base64 encoded WAV
     residual: str  # Base64 encoded WAV
     sample_rate: int
+
+
+class ReFeliciaTTSRequest(BaseModel):
+    text: str
+    model: str | None = None
+    voice: str | None = None
+    lang_code: str | None = None
+    ref_audio: str | None = None
+    instruct: str | None = None
+    caption: str | None = None
+    speed: float | None = 1.0
+    pitch_scale: float | None = 1.0
+    intonation_scale: float | None = 1.0
+    delivery_mode: str | None = "full_audio"
+    streaming_interval: float | None = 0.24
+    seconds: float | None = None
+    duration_scale: float | None = None
+    num_steps: int | None = None
+    sequence_length: int | None = None
+    cfg_guidance_mode: str | None = None
+    t_schedule_mode: str | None = None
+    sway_coeff: float | None = None
+    segment_target_chars: int | None = 18
+    segment_max_chars: int | None = 28
+    crossfade_ms: int | None = 80
+    trim_silence_ms: int | None = 60
+    silence_threshold: int | None = 192
 
 
 # Initialize the ModelProvider
@@ -634,6 +662,16 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
             "max_tokens": speech_request.max_tokens,
             "verbose": speech_request.verbose,
         }
+        if (
+            _is_kokoro_tts_model(model, request.model_name)
+            and _contains_japanese_text(speech_request.input)
+            and speech_request.lang_code in (None, "a")
+        ):
+            generate_kwargs["lang_code"] = "j"
+            generate_kwargs["voice"] = _kokoro_voice_for_lang(
+                generate_kwargs.get("voice"),
+                "j",
+            )
 
         for result in model.generate(speech_request.input, **generate_kwargs):
             if request.cancel_event.is_set():
@@ -864,6 +902,328 @@ async def _await_inference_result(handle: InferenceHandle):
             result = chunk.payload
     finally:
         handle.cancel()
+
+
+def _resolve_refelicia_tts_model(model_name: str | None) -> str:
+    configured_model = os.getenv("MLX_AUDIO_REFELICIA_TTS_MODEL")
+    if configured_model and (not model_name or model_name == "amitaro"):
+        return configured_model
+    if model_name:
+        return model_name
+    if configured_model:
+        return configured_model
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "TTS model is required. Send a model in the WebSocket request or set "
+            "MLX_AUDIO_REFELICIA_TTS_MODEL."
+        ),
+    )
+
+
+def _env_float(name: str) -> float | None:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return None
+    return float(value)
+
+
+def _env_int(name: str) -> int | None:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return None
+    return int(value)
+
+
+def _is_irodori_tts_model(model: Any, model_name: str) -> bool:
+    model_type = str(getattr(model, "model_type", "") or "").lower()
+    return model_type == "irodori_tts" or "irodori" in model_name.lower()
+
+
+def _is_kokoro_tts_model(model: Any, model_name: str) -> bool:
+    model_type = str(getattr(model, "model_type", "") or "").lower()
+    return model_type == "kokoro" or "kokoro" in model_name.lower()
+
+
+def _contains_japanese_text(text: str | None) -> bool:
+    if not text:
+        return False
+    return any(
+        ("\u3040" <= char <= "\u30ff")
+        or ("\u3400" <= char <= "\u9fff")
+        for char in text
+    )
+
+
+def _kokoro_voice_for_lang(voice: str | None, lang_code: str | None) -> str | None:
+    if lang_code != "j":
+        return voice
+    if not voice or voice.startswith(("a", "b", "e", "f", "h", "i", "p", "z")):
+        return os.getenv("MLX_AUDIO_REFELICIA_TTS_VOICE") or "jf_alpha"
+    return voice
+
+
+def _refelicia_lang_code(
+    payload: ReFeliciaTTSRequest,
+    *,
+    model: Any,
+    model_name: str,
+) -> str | None:
+    lang_code = payload.lang_code or os.getenv("MLX_AUDIO_REFELICIA_TTS_LANG_CODE")
+    if lang_code:
+        return lang_code
+
+    if not _is_kokoro_tts_model(model, model_name):
+        return None
+
+    if _contains_japanese_text(payload.text):
+        return "j"
+
+    voice = (payload.voice or os.getenv("MLX_AUDIO_REFELICIA_TTS_VOICE") or "").strip()
+    if len(voice) >= 2 and voice[0] in "abefhipjz" and voice[1] in "fm":
+        return voice[0]
+    return None
+
+
+_REFELICIA_REF_AUDIO_CACHE: dict[tuple[str, float, int], Any] = {}
+
+
+def _load_refelicia_ref_audio(path: str, sample_rate: int) -> Any:
+    """Load and resample reference audio once, then reuse across requests.
+
+    Keyed by (path, mtime, sample_rate) so replacing the file on disk
+    invalidates the cached waveform.
+    """
+    key = (os.path.abspath(path), os.path.getmtime(path), sample_rate)
+    cached = _REFELICIA_REF_AUDIO_CACHE.get(key)
+    if cached is None:
+        from mlx_audio.tts.generate import load_audio
+
+        cached = load_audio(path, sample_rate=sample_rate)
+        mx.eval(cached)
+        _REFELICIA_REF_AUDIO_CACHE.clear()
+        _REFELICIA_REF_AUDIO_CACHE[key] = cached
+    return cached
+
+
+def _refelicia_irodori_kwargs(
+    payload: ReFeliciaTTSRequest,
+    *,
+    model: Any,
+    model_name: str,
+) -> dict[str, Any]:
+    if not _is_irodori_tts_model(model, model_name):
+        return {}
+
+    ref_audio = payload.ref_audio or os.getenv("MLX_AUDIO_REFELICIA_TTS_REF_AUDIO")
+    caption = (
+        payload.caption
+        or payload.instruct
+        or os.getenv("MLX_AUDIO_REFELICIA_TTS_CAPTION")
+        or os.getenv("MLX_AUDIO_REFELICIA_TTS_INSTRUCT")
+    )
+
+    voice = (payload.voice or "").strip()
+    if voice and not ref_audio and os.path.exists(voice):
+        ref_audio = voice
+    elif voice and not caption:
+        caption = voice
+
+    if ref_audio and not os.path.exists(ref_audio):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Reference audio file not found: {ref_audio}",
+        )
+    if ref_audio:
+        ref_audio = _load_refelicia_ref_audio(
+            ref_audio,
+            int(getattr(model, "sample_rate", 24000) or 24000),
+        )
+
+    kwargs: dict[str, Any] = {
+        "ref_audio": ref_audio,
+        "instruct": caption,
+        "seconds": payload.seconds or _env_float("MLX_AUDIO_REFELICIA_TTS_SECONDS"),
+        "duration_scale": payload.duration_scale
+        or _env_float("MLX_AUDIO_REFELICIA_TTS_DURATION_SCALE"),
+        "num_steps": payload.num_steps
+        or _env_int("MLX_AUDIO_REFELICIA_TTS_NUM_STEPS"),
+        "sequence_length": payload.sequence_length
+        or _env_int("MLX_AUDIO_REFELICIA_TTS_SEQUENCE_LENGTH"),
+        "cfg_guidance_mode": payload.cfg_guidance_mode
+        or os.getenv("MLX_AUDIO_REFELICIA_TTS_CFG_GUIDANCE_MODE"),
+        "t_schedule_mode": payload.t_schedule_mode
+        or os.getenv("MLX_AUDIO_REFELICIA_TTS_T_SCHEDULE_MODE"),
+        "sway_coeff": payload.sway_coeff
+        or _env_float("MLX_AUDIO_REFELICIA_TTS_SWAY_COEFF"),
+    }
+    return {key: value for key, value in kwargs.items() if value is not None}
+
+
+# Segmented streaming for the ReFelicia TTS WebSocket. Mirrors the semantics of
+# ReFeliciaPython/style_bert_vits2_openai_server.py: a short first segment for
+# low TTFA, larger follow-up segments, silence trimming at the seams, and a
+# short crossfade between consecutive segments.
+_REFELICIA_SEGMENT_SPLIT_PATTERN = re.compile(r"(?<=[。！？!?\n])")
+_REFELICIA_CLAUSE_SPLIT_PATTERN = re.compile(r"(?<=[、,])")
+_REFELICIA_MIN_FIRST_SEGMENT_CHARS = 8
+
+
+def _split_long_refelicia_segment(text: str, max_chars: int) -> list[str]:
+    if len(text) <= max_chars:
+        return [text]
+    parts = [
+        part.strip()
+        for part in _REFELICIA_CLAUSE_SPLIT_PATTERN.split(text)
+        if part.strip()
+    ]
+    merged: list[str] = []
+    current = ""
+    for part in parts:
+        if current and len(current) + len(part) > max_chars:
+            merged.append(current)
+            current = part
+        else:
+            current += part
+    if current:
+        merged.append(current)
+    segments: list[str] = []
+    for segment in merged:
+        segments.extend(
+            segment[index : index + max_chars]
+            for index in range(0, len(segment), max_chars)
+        )
+    return segments
+
+
+def _merge_refelicia_clauses(
+    clauses: list[str],
+    *,
+    target_chars: int,
+    max_chars: int,
+) -> list[str]:
+    segments: list[str] = []
+    current = ""
+    for clause in clauses:
+        candidate = current + clause if current else clause
+        if current and len(candidate) > max_chars:
+            segments.extend(_split_long_refelicia_segment(current, max_chars))
+            current = clause
+        elif len(candidate) >= target_chars:
+            segments.extend(_split_long_refelicia_segment(candidate, max_chars))
+            current = ""
+        else:
+            current = candidate
+    if current:
+        segments.extend(_split_long_refelicia_segment(current, max_chars))
+    return segments
+
+
+def _split_refelicia_text_segments(
+    text: str,
+    target_chars: int,
+    max_chars: int,
+) -> list[str]:
+    normalized = text.strip()
+    if not normalized:
+        return []
+    clauses = [
+        clause.strip()
+        for clause in _REFELICIA_SEGMENT_SPLIT_PATTERN.split(normalized)
+        if clause.strip()
+    ]
+    if not clauses:
+        return [normalized]
+    while len(clauses) >= 2 and len(clauses[0]) < _REFELICIA_MIN_FIRST_SEGMENT_CHARS:
+        clauses = [clauses[0] + clauses[1], *clauses[2:]]
+
+    first_target_chars = max(6, min(target_chars, 10))
+    first_max_chars = max(first_target_chars, min(max_chars, 14))
+    follow_target_chars = max(max_chars, target_chars * 2)
+    follow_max_chars = max(follow_target_chars, max_chars * 2)
+
+    segments = _merge_refelicia_clauses(
+        clauses[:1],
+        target_chars=first_target_chars,
+        max_chars=first_max_chars,
+    )
+    if clauses[1:]:
+        segments.extend(
+            _merge_refelicia_clauses(
+                clauses[1:],
+                target_chars=follow_target_chars,
+                max_chars=follow_max_chars,
+            )
+        )
+    return segments or [normalized]
+
+
+def _trim_refelicia_pcm16_edges(
+    audio: np.ndarray,
+    sample_rate: int,
+    *,
+    max_trim_ms: int,
+    threshold: int,
+    trim_start: bool,
+    trim_end: bool,
+) -> np.ndarray:
+    if len(audio) == 0 or max_trim_ms <= 0 or threshold <= 0:
+        return audio
+
+    max_trim_samples = min(len(audio), int(sample_rate * max_trim_ms / 1000))
+    start_index = 0
+    end_index = len(audio)
+
+    if trim_start and max_trim_samples > 0:
+        while start_index < max_trim_samples and abs(int(audio[start_index])) <= threshold:
+            start_index += 1
+
+    if trim_end and max_trim_samples > 0:
+        tail_limit = len(audio) - max_trim_samples
+        while (
+            end_index > tail_limit
+            and end_index > start_index
+            and abs(int(audio[end_index - 1])) <= threshold
+        ):
+            end_index -= 1
+
+    trimmed = audio[start_index:end_index]
+    return trimmed if len(trimmed) > 0 else audio
+
+
+def _crossfade_refelicia_pcm16(
+    left_tail: np.ndarray,
+    right_head: np.ndarray,
+    overlap_samples: int,
+) -> np.ndarray:
+    overlap = min(len(left_tail), len(right_head), overlap_samples)
+    if overlap <= 0:
+        return np.concatenate([left_tail, right_head]).astype(np.int16, copy=False)
+
+    left = left_tail[-overlap:].astype(np.float32)
+    right = right_head[:overlap].astype(np.float32)
+    ramp = np.linspace(0.0, 1.0, overlap, endpoint=False, dtype=np.float32)
+    fused = np.round(left * (1.0 - ramp) + right * ramp).astype(np.int16)
+    return np.concatenate([fused, right_head[overlap:]]).astype(np.int16, copy=False)
+
+
+def _audio_to_pcm16le(audio: Any) -> bytes:
+    audio_array = np.asarray(audio)
+    if audio_array.ndim > 1:
+        audio_array = np.mean(audio_array, axis=-1)
+    audio_array = np.nan_to_num(audio_array.astype(np.float32), copy=False)
+    audio_array = np.clip(audio_array, -1.0, 1.0)
+    return (audio_array * 32767.0).astype("<i2").tobytes()
+
+
+def _filter_generate_kwargs(generate, kwargs: dict[str, Any]) -> dict[str, Any]:
+    signature = inspect.signature(generate)
+    if any(
+        param.kind == inspect.Parameter.VAR_KEYWORD
+        for param in signature.parameters.values()
+    ):
+        return kwargs
+    return {key: value for key, value in kwargs.items() if key in signature.parameters}
 
 
 @app.get("/")
@@ -1149,6 +1509,312 @@ async def audio_separations(
         },
     )
     return await _await_inference_result(handle)
+
+
+async def _handle_refelicia_tts_request(
+    websocket: WebSocket,
+    payload: ReFeliciaTTSRequest,
+) -> None:
+    model_name = _resolve_refelicia_tts_model(payload.model)
+    model = await asyncio.to_thread(_load_model_for_inference, model_name)
+
+    generate_kwargs = {
+        "voice": payload.voice or os.getenv("MLX_AUDIO_REFELICIA_TTS_VOICE") or None,
+        "speed": payload.speed,
+        "pitch": payload.pitch_scale,
+        "stream": False,
+        "streaming_interval": payload.streaming_interval,
+        "verbose": False,
+    }
+    lang_code = _refelicia_lang_code(payload, model=model, model_name=model_name)
+    if lang_code is not None:
+        generate_kwargs["lang_code"] = lang_code
+        if _is_kokoro_tts_model(model, model_name):
+            generate_kwargs["voice"] = _kokoro_voice_for_lang(
+                generate_kwargs.get("voice"),
+                lang_code,
+            )
+    generate_kwargs.update(
+        _refelicia_irodori_kwargs(payload, model=model, model_name=model_name)
+    )
+    generate_kwargs = _filter_generate_kwargs(model.generate, generate_kwargs)
+
+    started_at = time.time()
+    sample_rate = int(getattr(model, "sample_rate", 24000) or 24000)
+
+    delivery_mode = (payload.delivery_mode or "full_audio").strip().lower()
+    if delivery_mode != "full_audio":
+        await _stream_refelicia_tts_segments(
+            websocket,
+            model=model,
+            payload=payload,
+            generate_kwargs=generate_kwargs,
+            sample_rate=sample_rate,
+            started_at=started_at,
+        )
+        return
+
+    generated_chunks: list[tuple[bytes, int]] = []
+
+    for result in model.generate(payload.text, **generate_kwargs):
+        result_audio = getattr(result, "audio", None)
+        if result_audio is None:
+            continue
+        result_sample_rate = int(getattr(result, "sample_rate", sample_rate))
+        if result_sample_rate > 0:
+            sample_rate = result_sample_rate
+
+        pcm = _audio_to_pcm16le(result_audio)
+        if pcm:
+            generated_chunks.append((pcm, sample_rate))
+
+    first_pcm_ready_seconds = time.time() - started_at if generated_chunks else 0.0
+
+    dump_path = os.getenv("MLX_AUDIO_REFELICIA_TTS_DUMP_WAV")
+    if dump_path and generated_chunks:
+        dump_pcm = b"".join(chunk for chunk, _ in generated_chunks)
+        dump_audio = np.frombuffer(dump_pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        audio_write(dump_path, dump_audio, generated_chunks[-1][1])
+
+    await websocket.send_json(
+        {
+            "type": "start",
+            "mode": "tts",
+            "delivery_mode": payload.delivery_mode or "full_audio",
+            "sample_rate": sample_rate,
+            "channels": 1,
+            "format": "pcm_s16le",
+        }
+    )
+    start_sent_seconds = time.time() - started_at
+
+    chunks_sent = 0
+    samples_sent = 0
+    first_chunk_sent_seconds = 0.0
+    for pcm, chunk_sample_rate in generated_chunks:
+        sample_rate = chunk_sample_rate
+        await websocket.send_bytes(pcm)
+        chunks_sent += 1
+        samples_sent += len(pcm) // 2
+        if chunks_sent == 1:
+            first_chunk_sent_seconds = time.time() - started_at
+
+    generate_seconds = time.time() - started_at
+    audio_seconds = samples_sent / sample_rate if sample_rate > 0 else 0.0
+    await websocket.send_json(
+        {
+            "type": "end",
+            "chunks": chunks_sent,
+            "delivery_mode": payload.delivery_mode or "full_audio",
+            "audio_seconds": audio_seconds,
+            "generate_seconds": generate_seconds,
+            "real_time_factor": generate_seconds / audio_seconds
+            if audio_seconds > 0
+            else 0.0,
+            "first_pcm_ready_seconds": first_pcm_ready_seconds,
+            "start_sent_seconds": start_sent_seconds,
+            "first_chunk_sent_seconds": first_chunk_sent_seconds,
+            "segments": 1 if chunks_sent else 0,
+        }
+    )
+    _log_refelicia_tts_request(
+        mode="full_audio",
+        text=payload.text,
+        segments=1,
+        first_pcm_ready_seconds=first_pcm_ready_seconds,
+        generate_seconds=generate_seconds,
+        audio_seconds=audio_seconds,
+    )
+
+
+def _log_refelicia_tts_request(
+    *,
+    mode: str,
+    text: str,
+    segments: int,
+    first_pcm_ready_seconds: float,
+    generate_seconds: float,
+    audio_seconds: float,
+) -> None:
+    rtf = generate_seconds / audio_seconds if audio_seconds > 0 else 0.0
+    print(
+        f"[refelicia-tts] mode={mode} chars={len(text)} segments={segments} "
+        f"first_pcm={first_pcm_ready_seconds * 1000:.0f}ms "
+        f"total={generate_seconds * 1000:.0f}ms "
+        f"audio={audio_seconds:.2f}s rtf={rtf:.2f}",
+        flush=True,
+    )
+
+
+async def _stream_refelicia_tts_segments(
+    websocket: WebSocket,
+    *,
+    model: Any,
+    payload: ReFeliciaTTSRequest,
+    generate_kwargs: dict[str, Any],
+    sample_rate: int,
+    started_at: float,
+) -> None:
+    """Generate per text segment and send PCM as soon as each segment is ready.
+
+    TTFA is bounded by the first (short) segment instead of the full utterance.
+    """
+    segments = _split_refelicia_text_segments(
+        payload.text,
+        payload.segment_target_chars or 18,
+        payload.segment_max_chars or 28,
+    )
+
+    # Load the reference audio once so each segment does not re-read and
+    # resample the file.
+    ref_audio = generate_kwargs.get("ref_audio")
+    if isinstance(ref_audio, str):
+        from mlx_audio.tts.generate import load_audio
+
+        generate_kwargs["ref_audio"] = load_audio(ref_audio, sample_rate=sample_rate)
+
+    await websocket.send_json(
+        {
+            "type": "start",
+            "mode": "tts",
+            "delivery_mode": payload.delivery_mode,
+            "sample_rate": sample_rate,
+            "channels": 1,
+            "format": "pcm_s16le",
+        }
+    )
+    start_sent_seconds = time.time() - started_at
+
+    overlap_samples = max(0, int(sample_rate * (payload.crossfade_ms or 0) / 1000))
+    pending_tail: np.ndarray | None = None
+    sent_pcm: list[bytes] = []
+    chunks_sent = 0
+    samples_sent = 0
+    first_pcm_ready_seconds = 0.0
+    first_chunk_sent_seconds = 0.0
+
+    async def send_pcm(pcm: np.ndarray) -> None:
+        nonlocal chunks_sent, samples_sent, first_chunk_sent_seconds
+        data = pcm.astype(np.int16, copy=False).tobytes()
+        if not data:
+            return
+        await websocket.send_bytes(data)
+        sent_pcm.append(data)
+        chunks_sent += 1
+        samples_sent += len(pcm)
+        if chunks_sent == 1:
+            first_chunk_sent_seconds = time.time() - started_at
+
+    def render_segment(segment_text: str) -> np.ndarray | None:
+        segment_parts: list[np.ndarray] = []
+        for result in model.generate(segment_text, **generate_kwargs):
+            result_audio = getattr(result, "audio", None)
+            if result_audio is None:
+                continue
+            pcm = _audio_to_pcm16le(result_audio)
+            if pcm:
+                segment_parts.append(np.frombuffer(pcm, dtype=np.int16))
+        if not segment_parts:
+            return None
+        return (
+            np.concatenate(segment_parts)
+            if len(segment_parts) > 1
+            else segment_parts[0]
+        )
+
+    for index, segment_text in enumerate(segments):
+        # Run blocking inference off the event loop so already-rendered
+        # segments reach the client while the next one is generating.
+        segment_pcm = await asyncio.to_thread(render_segment, segment_text)
+        if segment_pcm is None:
+            continue
+        if first_pcm_ready_seconds == 0.0:
+            first_pcm_ready_seconds = time.time() - started_at
+
+        segment_pcm = _trim_refelicia_pcm16_edges(
+            segment_pcm,
+            sample_rate,
+            max_trim_ms=payload.trim_silence_ms or 0,
+            threshold=payload.silence_threshold or 0,
+            trim_start=index > 0,
+            trim_end=index < len(segments) - 1,
+        )
+        if pending_tail is not None:
+            segment_pcm = _crossfade_refelicia_pcm16(
+                pending_tail, segment_pcm, overlap_samples
+            )
+            pending_tail = None
+
+        is_last = index == len(segments) - 1
+        if not is_last and overlap_samples > 0 and len(segment_pcm) > overlap_samples * 2:
+            body = segment_pcm[:-overlap_samples]
+            pending_tail = segment_pcm[-overlap_samples:]
+        else:
+            body = segment_pcm
+        await send_pcm(body)
+
+    if pending_tail is not None:
+        await send_pcm(pending_tail)
+
+    dump_path = os.getenv("MLX_AUDIO_REFELICIA_TTS_DUMP_WAV")
+    if dump_path and sent_pcm:
+        dump_audio = (
+            np.frombuffer(b"".join(sent_pcm), dtype=np.int16).astype(np.float32)
+            / 32768.0
+        )
+        audio_write(dump_path, dump_audio, sample_rate)
+
+    generate_seconds = time.time() - started_at
+    audio_seconds = samples_sent / sample_rate if sample_rate > 0 else 0.0
+    await websocket.send_json(
+        {
+            "type": "end",
+            "chunks": chunks_sent,
+            "delivery_mode": payload.delivery_mode,
+            "audio_seconds": audio_seconds,
+            "generate_seconds": generate_seconds,
+            "real_time_factor": generate_seconds / audio_seconds
+            if audio_seconds > 0
+            else 0.0,
+            "first_pcm_ready_seconds": first_pcm_ready_seconds,
+            "start_sent_seconds": start_sent_seconds,
+            "first_chunk_sent_seconds": first_chunk_sent_seconds,
+            "segments": len(segments),
+        }
+    )
+    _log_refelicia_tts_request(
+        mode=payload.delivery_mode or "streaming",
+        text=payload.text,
+        segments=len(segments),
+        first_pcm_ready_seconds=first_pcm_ready_seconds,
+        generate_seconds=generate_seconds,
+        audio_seconds=audio_seconds,
+    )
+
+
+@app.websocket("/ws/tts")
+async def refelicia_tts_websocket(websocket: WebSocket):
+    """ReFelicia/SBV2-compatible TTS WebSocket.
+
+    ReFeliciaV2 sends JSON requests and expects, per request:
+    ``{"type":"start", ...}``, raw mono PCM16LE binary chunks, then
+    ``{"type":"end", ...}``.
+    """
+    await websocket.accept()
+
+    while True:
+        try:
+            payload = ReFeliciaTTSRequest.model_validate(
+                await websocket.receive_json()
+            )
+            await _handle_refelicia_tts_request(websocket, payload)
+        except WebSocketDisconnect:
+            return
+        except Exception as exc:
+            try:
+                await websocket.send_json({"type": "error", "message": str(exc)})
+            except Exception:
+                return
 
 
 async def _stream_transcription(
