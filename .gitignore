@@ -45,6 +45,7 @@ output/
 # uv
 .build
 claude.md
+!CLAUDE.md
 .claude/site/
 .generated/legacy-docs-generated/
 
